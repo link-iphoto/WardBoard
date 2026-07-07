@@ -1,3 +1,7 @@
 wardboard.sqlite3
 __pycache__/
 *.pyc
+
+# Logs / screenshots
+logs/*
+!logs/.gitkeep
