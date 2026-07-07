@@ -42,6 +42,7 @@ DAY_LABELS = {
     "thursday": "木",
     "friday": "金",
 }
+PRINT_TABLE_ROWS = 22
 
 
 def db() -> sqlite3.Connection:
@@ -311,9 +312,10 @@ def layout(active: str, title: str, subtitle: str, body: str, actions: str = "")
         "timeline": "▣ タイムライン",
         "patients": "○ 患者情報",
         "wheelchairs": "♿ 車椅子情報",
-        "print": "▤ 印刷",
+        "print": "▤ 離床表印刷",
     }
     links = "".join(f'<a class="{"active" if key == active else ""}" href="{url}">{labels[key]}</a>' for key, url in nav.items())
+    action_class = "header-actions print-actions" if active == "print" else "header-actions"
     html_doc = f"""<!doctype html>
 <html lang="ja">
 <head>
@@ -326,7 +328,7 @@ def layout(active: str, title: str, subtitle: str, body: str, actions: str = "")
       document.documentElement.dataset.theme = theme === "dark" ? "dark" : "light";
     }})();
   </script>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=print-footer-nav-1">
 </head>
 <body>
   <aside class="sidebar">
@@ -343,7 +345,7 @@ def layout(active: str, title: str, subtitle: str, body: str, actions: str = "")
     <div class="version">WardBoard v0.1.0</div>
   </aside>
   <main class="main">
-    <header class="page-header"><div><h1>{esc(title)}</h1><p>{esc(subtitle)}</p></div><div class="header-actions">{actions}</div></header>
+    <header class="page-header"><div><h1>{esc(title)}</h1><p>{esc(subtitle)}</p></div><div class="{action_class}">{actions}</div></header>
     {body}
   </main>
   <script src="/static/theme.js?v=dark-mode-1"></script>
@@ -562,11 +564,11 @@ def options(current: str, values: list[tuple[str, str]]) -> str:
     return "".join(f'<option value="{esc(value)}" {"selected" if current == value else ""}>{esc(label)}</option>' for value, label in values)
 
 
-def build_weekly_print() -> dict:
+def build_weekly_print(group_name: str) -> dict:
     week: dict[str, dict] = {}
     all_items: list[dict] = []
     for day in DAYS:
-        data = [dict(item) for item in assignments_for_day(day)]
+        data = [dict(item) for item in assignments_for_day(day) if item["group_name"] == group_name]
         for item in data:
             item["start_time"] = slot_to_time(item["start_slot"])
             item["end_time"] = slot_to_time(item["end_slot"])
@@ -590,24 +592,95 @@ def build_weekly_print() -> dict:
     }
 
 
-def render_print() -> bytes:
-    weekly = build_weekly_print()
-    cards = []
+def render_print(query: dict[str, list[str]]) -> bytes:
+    group_name = query.get("group", ["A"])[0]
+    if group_name not in ("A", "B"):
+        group_name = "A"
+    current_page = query.get("page", ["1"])[0]
+    if current_page not in ("1", "2"):
+        current_page = "1"
+    weekly = build_weekly_print(group_name)
+    day_items: dict[str, list[dict]] = {}
     for day in DAYS:
-        morning = weekly["days"][day]["morning"]
-        later = weekly["days"][day]["later"]
-        count = max(len(morning), len(later), 1)
-        trs = []
-        for i in range(count):
-            m = morning[i] if i < len(morning) else None
-            l = later[i] if i < len(later) else None
-            trs.append(f"<tr><td>{esc(m['bed_label'] + '　' + m['patient_name']) if m else ''}</td><td>{esc(l['start_time'] + '　' + l['bed_label'] + '　' + l['patient_name'] + '　' + l['wheelchair_name']) if l else ''}</td><td>{esc(l['end_time'] if l else m['end_time'] if m else '')}</td></tr>")
-        cards.append(f'<section class="print-card"><h2>{DAY_LABELS[day]}曜日の離床表</h2><table><thead><tr><th>現在起きている人</th><th>これから起こす人</th><th>戻す時間</th></tr></thead><tbody>{"".join(trs)}</tbody></table></section>')
-    always_rows = "".join(f"<tr><td>{esc(i['bed_label'] + '　' + i['patient_name'])}</td><td>{esc(i['note'])}</td></tr>" for i in weekly["always_up"]) or "<tr><td>なし</td><td></td></tr>"
-    meal_rows = "".join(f"<tr><td>{esc(i['patient_name'])}</td><td>{esc(i['bed_label'])}</td></tr>" for i in weekly["every_meal"]) or "<tr><td>なし</td><td></td></tr>"
-    cards.append(f'<section class="print-card list-card"><h2>常時起きる人・毎食起きる人一覧</h2><div class="two-col"><table><thead><tr><th>常時起きる人</th><th>備考</th></tr></thead><tbody>{always_rows}</tbody></table><table><thead><tr><th>毎食起きる人</th><th>部屋</th></tr></thead><tbody>{meal_rows}</tbody></table></div></section>')
-    body = f'<section class="print-sheet"><div class="print-title">離床表（週間予定）</div><div class="print-grid">{"".join(cards)}</div></section>'
-    return layout("print", "印刷", "月〜金の予定から離床表を生成します", body, '<button class="button primary" onclick="window.print()">印刷する</button>')
+        items = weekly["days"][day]["morning"] + weekly["days"][day]["later"]
+        day_items[day] = sorted(items, key=lambda x: (x["start_slot"], x["room_number"], x["bed_number"], x["patient_name"]))
+
+    def blank_row(cols: int) -> str:
+        return "<tr>" + "".join("<td></td>" for _ in range(cols)) + "</tr>"
+
+    def fill_rows(rows_html: list[str], cols: int) -> str:
+        target = max(PRINT_TABLE_ROWS, len(rows_html))
+        rows_html.extend(blank_row(cols) for _ in range(target - len(rows_html)))
+        return "".join(rows_html)
+
+    def day_card(day: str) -> str:
+        rows_html = [
+            f"<tr><td>{esc(item['bed_label'] + '　' + item['patient_name'])}</td><td>{esc(item['start_time'])}</td><td>{esc(item['end_time'])}</td></tr>"
+            for item in day_items[day]
+        ]
+        return f"""
+        <section class="print-card day-card">
+          <h2>{DAY_LABELS[day]}曜日の離床表</h2>
+          <table>
+            <thead><tr><th>部屋番号＋氏名</th><th>離床時間</th><th>戻す時間</th></tr></thead>
+            <tbody>{fill_rows(rows_html, 3)}</tbody>
+          </table>
+        </section>
+        """
+
+    always_entries = [f"{i['bed_label']}　{i['patient_name']}" for i in weekly["always_up"]]
+    meal_entries = [f"{i['bed_label']}　{i['patient_name']}" for i in weekly["every_meal"]]
+    list_rows = []
+    list_count = max(PRINT_TABLE_ROWS, len(always_entries), len(meal_entries))
+    for index in range(list_count):
+        always_value = always_entries[index] if index < len(always_entries) else ""
+        meal_value = meal_entries[index] if index < len(meal_entries) else ""
+        list_rows.append(f"<tr><td>{esc(always_value)}</td><td>{esc(meal_value)}</td></tr>")
+    list_card = f"""
+    <section class="print-card list-card">
+      <h2>常時起きる人・毎食起きる人一覧</h2>
+      <table>
+        <thead><tr><th>常時起きる人</th><th>毎食起きる人</th></tr></thead>
+        <tbody>{''.join(list_rows)}</tbody>
+      </table>
+    </section>
+    """
+
+    page1_hidden = "" if current_page == "1" else " hidden aria-hidden=\"true\""
+    page2_hidden = "" if current_page == "2" else " hidden aria-hidden=\"true\""
+    page1 = f'<section class="print-page" data-print-page="1"{page1_hidden}><div class="print-page-label">{group_name}グループ 離床表 1/2</div><div class="print-columns">{list_card}{day_card("monday")}{day_card("tuesday")}</div></section>'
+    page2 = f'<section class="print-page" data-print-page="2"{page2_hidden}><div class="print-page-label">{group_name}グループ 離床表 2/2</div><div class="print-columns">{day_card("wednesday")}{day_card("thursday")}{day_card("friday")}</div></section>'
+    previous_link = f'/print?group={group_name}&page=1'
+    next_link = f'/print?group={group_name}&page=2'
+    previous_control = (
+        '<span class="pager-button disabled" aria-disabled="true">‹ 前へ</span>'
+        if current_page == "1"
+        else f'<a class="pager-button" href="{previous_link}">‹ 前へ</a>'
+    )
+    next_control = (
+        '<span class="pager-button disabled" aria-disabled="true">次へ ›</span>'
+        if current_page == "2"
+        else f'<a class="pager-button" href="{next_link}">次へ ›</a>'
+    )
+    page_footer = f"""
+    <footer class="print-preview-footer print-hide">
+      {previous_control}
+      <div class="pager-dots" aria-label="ページ切替">
+        <a class="pager-dot {"active" if current_page == "1" else ""}" href="/print?group={group_name}&page=1" aria-label="1ページ目">1</a>
+        <a class="pager-dot {"active" if current_page == "2" else ""}" href="/print?group={group_name}&page=2" aria-label="2ページ目">2</a>
+      </div>
+      {next_control}
+    </footer>
+    """
+    body = f'<section class="print-sheet">{page1}{page2}</section>{page_footer}'
+    actions = f"""
+    <div class="print-group-tabs">
+      <a class="segmented {"active" if group_name == "A" else ""}" href="/print?group=A&page=1">Aグループ</a>
+      <a class="segmented {"active" if group_name == "B" else ""}" href="/print?group=B&page=1">Bグループ</a>
+    </div>
+    <button class="button primary" onclick="window.print()">印刷する</button>
+    """
+    return layout("print", "離床表印刷", f"{group_name}グループの離床表プレビューです。表示中のページだけを印刷します。", body, actions)
 
 
 class WardBoardHandler(BaseHTTPRequestHandler):
@@ -623,7 +696,7 @@ class WardBoardHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/wheelchairs":
             self.html(render_wheelchairs(query))
         elif parsed.path == "/print":
-            self.html(render_print())
+            self.html(render_print(query))
         elif parsed.path == "/api/bootstrap":
             self.json({
                 "days": DAYS,
