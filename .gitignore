@@ -5,3 +5,7 @@ __pycache__/
 # Logs / screenshots
 logs/*
 !logs/.gitkeep
+
+# Working screenshots / reference images
+images/*
+!images/.gitkeep
